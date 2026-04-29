@@ -1,17 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║           QuantBot v7.0 — Professional Edition                   ║
-║           Live Market Intelligence Engine                        ║
+║           QuantBot v7.2 — Final Fix                              ║
 ║                                                                  ║
-║  إصلاحات v7.0:                                                   ║
-║  ✅ Q-table رباعية الأبعاد مع CVD حقيقي                         ║
-║  ✅ Discounted Reward عبر كامل مسار الصفقة                      ║
-║  ✅ record_step داخل monitor() في كل تيك                         ║
-║  ✅ تصفير daily_pnl تلقائياً كل يوم                              ║
-║  ✅ Kelly Criterion من بيانات حقيقية مع Bayesian smoothing        ║
-║  ✅ ATR ديناميكي لحساب TP/SL                                     ║
-║  ✅ فصل كامل بين المكونات (Zero globals)                         ║
-║  ✅ معالجة أخطاء شاملة مع graceful shutdown                      ║
+║  إصلاح v7.2:                                                     ║
+║  ✅ SHAPE = (3,3,3,3,3) — البُعد الخامس للـ action               ║
+║  ✅ learn() يستخدم [state][action] بشكل صحيح                     ║
+║  ✅ حذف q_table.npy تلقائياً عند تعارض الأبعاد                  ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -43,16 +37,16 @@ log = logging.getLogger("QuantBot")
 
 # ─── ثوابت المشروع ────────────────────────────────────────────────────────────
 os.makedirs("memory", exist_ok=True)
-Q_TABLE_FILE  = "memory/q_table.npy"
-TRADES_FILE   = "memory/trades_history.csv"
-SYMBOL        = "SOL/USDT"
+Q_TABLE_FILE = "memory/q_table.npy"
+TRADES_FILE  = "memory/trades_history.csv"
+SYMBOL       = "SOL/USDT"
 
 # ─── هياكل البيانات ──────────────────────────────────────────────────────────
 @dataclass
 class Tick:
     price:  float
     amount: float
-    side:   str   # 'buy' | 'sell'
+    side:   str
 
 @dataclass
 class TradeRecord:
@@ -72,13 +66,9 @@ class BrainStep:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. RiskManager — إدارة رأس المال والأمان
+# 1. RiskManager
 # ══════════════════════════════════════════════════════════════════════════════
 class RiskManager:
-    """
-    يحسب حجم المركز عبر Kelly Criterion مع Bayesian smoothing،
-    ويطبّق قاطع تيار يومي تلقائي.
-    """
     def __init__(
         self,
         total_balance:      float = 1_000.0,
@@ -94,19 +84,16 @@ class RiskManager:
         self.min_risk_pct      = min_risk_pct
         self.max_risk_pct      = max_risk_pct
         self.reward_risk_ratio = reward_risk_ratio
-
         self.daily_pnl         = 0.0
         self._last_reset: date = datetime.now().date()
 
-    # ── تصفير يومي تلقائي ────────────────────────────────────────────────────
     def _auto_reset(self) -> None:
         today = datetime.now().date()
         if today > self._last_reset:
             log.info(f"📅 يوم جديد — تصفير PnL اليومي (كان: ${self.daily_pnl:+.2f})")
-            self.daily_pnl    = 0.0
-            self._last_reset  = today
+            self.daily_pnl   = 0.0
+            self._last_reset = today
 
-    # ── قاطع التيار ──────────────────────────────────────────────────────────
     def is_trading_allowed(self) -> bool:
         self._auto_reset()
         if self.daily_pnl <= -self.max_daily_loss:
@@ -117,29 +104,21 @@ class RiskManager:
             return False
         return True
 
-    # ── Win Rate بـ Bayesian smoothing ───────────────────────────────────────
     def _get_win_rate(self, prior_wins: int = 3, prior_total: int = 6) -> float:
-        """
-        Bayesian smoothing: يدمج النتائج الحقيقية مع prior متحفظ (50%)
-        لتجنب التطرف عند قلة البيانات.
-        """
         try:
             df = pd.read_csv(TRADES_FILE)
             if df.empty or "pnl_usd" not in df.columns:
                 return prior_wins / prior_total
             wins  = len(df[df["pnl_usd"] > 0])
             total = len(df)
-            # Bayesian: (wins + prior_wins) / (total + prior_total)
             return (wins + prior_wins) / (total + prior_total)
         except (FileNotFoundError, pd.errors.EmptyDataError):
             return prior_wins / prior_total
 
-    # ── حجم المركز ───────────────────────────────────────────────────────────
     def calculate_position_size(self) -> float:
         win_rate = self._get_win_rate()
         b        = self.reward_risk_ratio
         kelly    = (win_rate * b - (1 - win_rate)) / b
-        # نصف Kelly + تقييد بين الحد الأدنى والأقصى
         risk_pct = min(max(kelly * self.kelly_fraction, self.min_risk_pct), self.max_risk_pct)
         size     = self.total_balance * risk_pct
         log.debug(f"📐 WinRate={win_rate:.2%} Kelly={kelly:.3f} Size=${size:.2f}")
@@ -150,26 +129,18 @@ class RiskManager:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. MarketAnalyzer — تحليل السوق لحظياً
+# 2. MarketAnalyzer
 # ══════════════════════════════════════════════════════════════════════════════
 class MarketAnalyzer:
-    """
-    يحسب:
-    - OFI  : Order Flow Imbalance  (نسبة الشراء/البيع)
-    - CVD  : Cumulative Volume Delta (الزخم التراكمي)
-    - Vol  : Volatility  (الانحراف المعياري للأسعار)
-    - ATR  : Average True Range  (لتحديد TP/SL)
-    """
     def __init__(self, window: int = 500, atr_window: int = 100):
-        self.ticks:     deque = deque(maxlen=window)
-        self.prices:    deque = deque(maxlen=atr_window)
-        self.cvd:       float = 0.0
+        self.ticks:  deque = deque(maxlen=window)
+        self.prices: deque = deque(maxlen=atr_window)
+        self.cvd:    float = 0.0
 
     def add_tick(self, tick: Tick) -> None:
         self.ticks.append(tick)
         self.prices.append(tick.price)
-        delta = tick.amount if tick.side == "buy" else -tick.amount
-        self.cvd += delta
+        self.cvd += tick.amount if tick.side == "buy" else -tick.amount
 
     @property
     def is_ready(self) -> bool:
@@ -188,9 +159,6 @@ class MarketAnalyzer:
         return float(np.std(list(self.prices)) / last_price) if last_price > 0 else 0.001
 
     def get_atr(self) -> float:
-        """
-        ATR مبسّط: متوسط الفرق المطلق بين كل سعر والسابق له.
-        """
         prices = list(self.prices)
         if len(prices) < 2:
             return 0.002
@@ -198,35 +166,28 @@ class MarketAnalyzer:
         return float(np.mean(diffs)) / prices[-1] if prices[-1] > 0 else 0.002
 
     def get_cvd_signal(self) -> int:
-        """0=سلبي، 1=محايد، 2=إيجابي"""
-        if self.cvd < -500:   return 0
-        if self.cvd > 500:    return 2
+        if self.cvd < -500: return 0
+        if self.cvd >  500: return 2
         return 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. QuantBrain — العقل الكمي المتعلم
+# 3. QuantBrain
 # ══════════════════════════════════════════════════════════════════════════════
 class QuantBrain:
-    """
-    Q-Learning بـ 4 أبعاد حقيقية:
-    (OFI state × Volatility state × CVD state × Trend state) → Action
-
-    التعلم يتم عبر Discounted Reward على كامل مسار الصفقة.
-    """
-    # شكل الـ Q-table: 4 أبعاد × 3 حالات لكل بعد × 3 قرارات
-    SHAPE = (3, 3, 3, 3)   # → 81 خلية
+    # 4 أبعاد للحالة × 3 قرارات = شكل صحيح للوصول بـ [state][action]
+    SHAPE = (3, 3, 3, 3, 3)
 
     def __init__(
         self,
-        learning_rate:    float = 0.05,
-        discount_factor:  float = 0.9,
-        explore_rate:     float = 0.1,
+        learning_rate:   float = 0.05,
+        discount_factor: float = 0.9,
+        explore_rate:    float = 0.1,
     ):
-        self.lr       = learning_rate
-        self.gamma    = discount_factor
-        self.epsilon  = explore_rate
-        self.q_table  = self._load_or_init()
+        self.lr      = learning_rate
+        self.gamma   = discount_factor
+        self.epsilon = explore_rate
+        self.q_table = self._load_or_init()
         self.trajectory: List[BrainStep] = []
 
     def _load_or_init(self) -> np.ndarray:
@@ -236,51 +197,51 @@ class QuantBrain:
                 if q.shape == self.SHAPE:
                     log.info("🧠 استُعيدت الذاكرة من الجلسة السابقة.")
                     return q
-            except Exception:
-                pass
+                else:
+                    log.warning(
+                        f"⚠️ شكل Q-table قديم {q.shape} ≠ {self.SHAPE} "
+                        f"— حذف تلقائي والبدء من الصفر."
+                    )
+                    os.remove(Q_TABLE_FILE)
+            except Exception as e:
+                log.warning(f"⚠️ تعذّر تحميل الذاكرة: {e} — بدء من الصفر.")
         log.info("🧠 بدء بعقل جديد من الصفر.")
         return np.zeros(self.SHAPE)
 
     def save(self) -> None:
         np.save(Q_TABLE_FILE, self.q_table)
 
-    # ── تصنيف الحالة ─────────────────────────────────────────────────────────
     def _classify(self, value: float, low: float, high: float) -> int:
-        if value < low:   return 0
-        if value > high:  return 2
+        if value < low:  return 0
+        if value > high: return 2
         return 1
 
     def get_state(self, ofi: float, vol: float, cvd_signal: int) -> Tuple:
-        s_ofi   = self._classify(ofi, -0.2,  0.2)
-        s_vol   = self._classify(vol, 0.0005, 0.0015)
-        s_cvd   = cvd_signal                          # 0/1/2 من MarketAnalyzer
-        # بُعد رابع: مزيج OFI × CVD (موافقة الزخم مع تدفق الأوامر)
+        s_ofi   = self._classify(ofi, -0.2,   0.2)
+        s_vol   = self._classify(vol,  0.0005, 0.0015)
+        s_cvd   = cvd_signal
         s_align = 1 if s_ofi == s_cvd else (0 if s_ofi < s_cvd else 2)
         return (s_ofi, s_vol, s_cvd, s_align)
 
-    # ── اختيار القرار ────────────────────────────────────────────────────────
     def select_action(self, state: Tuple) -> int:
         if random.random() < self.epsilon:
             return random.randint(0, 2)
         return int(np.argmax(self.q_table[state]))
 
-    # ── تسجيل الخطوة ─────────────────────────────────────────────────────────
     def record_step(self, state: Tuple, action: int) -> None:
         self.trajectory.append(BrainStep(state=state, action=action))
 
-    # ── التعلم من كامل المسار بـ Discounted Reward ───────────────────────────
     def learn(self, final_pnl_pct: float) -> None:
         if not self.trajectory:
             return
 
-        base_reward = final_pnl_pct * 100   # تطبيع: 0.3% → 30
+        base_reward = final_pnl_pct * 100
 
-        # نمشي على المسار بالعكس ونطبق discount
         for i, step in enumerate(reversed(self.trajectory)):
-            discounted_reward = base_reward * (self.gamma ** i)
-            current_q  = self.q_table[step.state][step.action]
-            best_next_q = np.max(self.q_table[step.state])  # تقدير مستقبلي
-            td_error   = discounted_reward + self.gamma * best_next_q - current_q
+            # ✅ صحيح: [state] يُعيد مصفوفة 3 عناصر، [action] يختار منها
+            current_q   = self.q_table[step.state][step.action]
+            best_next_q = np.max(self.q_table[step.state])
+            td_error    = base_reward * (self.gamma ** i) + self.gamma * best_next_q - current_q
             self.q_table[step.state][step.action] += self.lr * td_error
 
         log.debug(f"🎓 تعلّم من {len(self.trajectory)} خطوة | Reward={base_reward:.2f}")
@@ -289,24 +250,18 @@ class QuantBrain:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. ExecutionEngine — محرك التنفيذ
+# 4. ExecutionEngine
 # ══════════════════════════════════════════════════════════════════════════════
 class ExecutionEngine:
-    """
-    يفتح ويراقب ويغلق المراكز.
-    TP/SL ديناميكيان مبنيان على ATR.
-    يُرسل كل خطوة إلى QuantBrain للتعلم.
-    """
     def __init__(self, brain: QuantBrain, risk: RiskManager, atr_multiplier: float = 2.0):
-        self.brain   = brain
-        self.risk    = risk
-        self.atr_m   = atr_multiplier
-
-        self.position:    Optional[str]   = None
-        self.entry_price: float           = 0.0
-        self.size_usd:    float           = 0.0
-        self.tp_pct:      float           = 0.0
-        self.sl_pct:      float           = 0.0
+        self.brain    = brain
+        self.risk     = risk
+        self.atr_m    = atr_multiplier
+        self.position:    Optional[str] = None
+        self.entry_price: float         = 0.0
+        self.size_usd:    float         = 0.0
+        self.tp_pct:      float         = 0.0
+        self.sl_pct:      float         = 0.0
 
     def has_position(self) -> bool:
         return self.position is not None
@@ -317,7 +272,6 @@ class ExecutionEngine:
         self.position    = side
         self.entry_price = price
         self.size_usd    = size
-        # TP = 1.5 × ATR،  SL = 1.0 × ATR
         self.sl_pct = max(atr * self.atr_m,       0.002)
         self.tp_pct = max(atr * self.atr_m * 1.5, 0.003)
         log.info(
@@ -327,22 +281,18 @@ class ExecutionEngine:
         )
 
     def monitor(self, price: float, state: Tuple, action: int) -> bool:
-        """
-        يُسجّل كل خطوة للتعلم، ويتحقق من شروط الخروج.
-        يُعيد True عند الإغلاق.
-        """
         if not self.position:
             return False
 
-        # ✅ تسجيل كل خطوة للتعلم (الإصلاح الجوهري)
+        # ✅ تسجيل كل خطوة للتعلم
         self.brain.record_step(state, action)
 
         pnl_pct = (price - self.entry_price) / self.entry_price
         if self.position == "SHORT":
             pnl_pct = -pnl_pct
 
-        hit_tp  = pnl_pct >=  self.tp_pct
-        hit_sl  = pnl_pct <= -self.sl_pct
+        hit_tp   = pnl_pct >=  self.tp_pct
+        hit_sl   = pnl_pct <= -self.sl_pct
         reversal = (
             (self.position == "LONG"  and action == 2) or
             (self.position == "SHORT" and action == 0)
@@ -351,7 +301,6 @@ class ExecutionEngine:
         if not (hit_tp or hit_sl or reversal):
             return False
 
-        # ── إغلاق المركز ────────────────────────────────────────────────────
         reason  = "🎯 هدف" if hit_tp else ("🛑 وقف" if hit_sl else "🔄 انعكاس")
         pnl_usd = self.size_usd * pnl_pct
 
@@ -360,7 +309,6 @@ class ExecutionEngine:
             f"| PnL=${pnl_usd:+.2f} ({pnl_pct*100:+.3f}%) | {reason}"
         )
 
-        # التعلم من كامل المسار
         self.brain.learn(pnl_pct)
         self.risk.record_pnl(pnl_usd)
         self._save_trade(price, pnl_pct, pnl_usd, reason)
@@ -389,7 +337,7 @@ class ExecutionEngine:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. LiveMarketStreamer — قلب البوت
+# 5. LiveMarketStreamer
 # ══════════════════════════════════════════════════════════════════════════════
 class LiveMarketStreamer:
     def __init__(self, symbol: str = SYMBOL):
@@ -404,10 +352,9 @@ class LiveMarketStreamer:
         self.execution = ExecutionEngine(self.brain, self.risk)
         self._running  = True
 
-    # ── الحلقة الرئيسية ───────────────────────────────────────────────────────
     async def stream(self) -> None:
         await self.exchange.load_markets()
-        log.info(f"✅ متصل بـ Bybit | الزوج: {self.symbol} | v7.0 جاهز")
+        log.info(f"✅ متصل بـ Bybit | الزوج: {self.symbol} | v7.2 جاهز")
 
         while self._running:
             try:
@@ -427,7 +374,6 @@ class LiveMarketStreamer:
                     if not self.analyzer.is_ready:
                         continue
 
-                    # ── حساب المؤشرات ──────────────────────────────────────
                     ofi        = self.analyzer.get_ofi()
                     vol        = self.analyzer.get_volatility()
                     cvd_signal = self.analyzer.get_cvd_signal()
@@ -436,15 +382,13 @@ class LiveMarketStreamer:
                     state  = self.brain.get_state(ofi, vol, cvd_signal)
                     action = self.brain.select_action(state)
 
-                    # ── إدارة المركز ───────────────────────────────────────
                     if self.execution.has_position():
                         self.execution.monitor(price, state, action)
                     elif action != 1 and self.risk.is_trading_allowed():
-                        # تسجيل قرار الدخول قبل فتح المركز
                         self.brain.record_step(state, action)
                         size = self.risk.calculate_position_size()
-                        side = "LONG" if action == 0 else "SHORT"
-                        self.execution.open(side, price, size, atr)
+                        side_str = "LONG" if action == 0 else "SHORT"
+                        self.execution.open(side_str, price, size, atr)
 
             except ccxt.NetworkError as e:
                 log.warning(f"🌐 انقطاع شبكة — إعادة اتصال... ({e})")
@@ -467,9 +411,7 @@ class LiveMarketStreamer:
 # 6. نقطة الدخول
 # ══════════════════════════════════════════════════════════════════════════════
 async def main() -> None:
-    bot = LiveMarketStreamer(SYMBOL)
-
-    # graceful shutdown عند Ctrl+C أو إشارات النظام
+    bot  = LiveMarketStreamer(SYMBOL)
     loop = asyncio.get_event_loop()
 
     def _handle_signal():
@@ -480,7 +422,7 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _handle_signal)
         except NotImplementedError:
-            pass  # Windows لا يدعم add_signal_handler
+            pass
 
     try:
         await bot.stream()
